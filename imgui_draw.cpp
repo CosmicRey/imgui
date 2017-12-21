@@ -7,6 +7,7 @@ Index of this file:
 
 // [SECTION] STB libraries implementation
 // [SECTION] Style functions
+// [SECTION] ImMatrix
 // [SECTION] ImDrawList
 // [SECTION] ImDrawListSplitter
 // [SECTION] ImDrawData
@@ -348,6 +349,38 @@ void ImGui::StyleColorsLight(ImGuiStyle* dst)
 }
 
 //-----------------------------------------------------------------------------
+// ImMatrix
+//-----------------------------------------------------------------------------
+ImMatrix ImMatrix::Inverted() const
+{
+    const float d00 = m11;
+    const float d01 = m01;
+
+    const float d10 = m10;
+    const float d11 = m00;
+
+    const float d20 = m10 * m21 - m11 * m20;
+    const float d21 = m00 * m21 - m01 * m20;
+
+    const float d = m00 * d00 - m10 * d01;
+
+    const float invD = d ? 1.0f / d : 0.0f;
+
+    return ImMatrix(
+         d00 * invD, -d01 * invD,
+        -d10 * invD,  d11 * invD,
+         d20 * invD, -d21 * invD);
+}
+
+ImMatrix ImMatrix::Rotation(float angle)
+{
+    const float s = sinf(angle);
+    const float c = cosf(angle);
+
+    return ImMatrix(c, s, -s, c, 0.0f, 0.0f);
+}
+
+//-----------------------------------------------------------------------------
 // ImDrawList
 //-----------------------------------------------------------------------------
 
@@ -397,6 +430,9 @@ void ImDrawList::Clear()
     _Path.resize(0);
     _ChannelsCurrent = 0;
     _ChannelsCount = 1;
+    _TransformationStack.resize(0);
+    _InvTransformationScale = 1.0f;
+    _HalfPixel = ImVec2(0.5f, 0.5f);
     // NB: Do not clear channels so our allocations are re-used after the first frame.
     _FringeScale = 1.0f;
 	_Splitter.Clear();
@@ -413,7 +449,17 @@ void ImDrawList::ClearFreeMemory()
     _ClipRectStack.clear();
     _TextureIdStack.clear();
     _Path.clear();
-    _Splitter.ClearFreeMemory();
+	_Splitter.ClearFreeMemory();
+    _ChannelsCurrent = 0;
+    _ChannelsCount = 1;
+    for (int i = 0; i < _Channels.Size; i++)
+    {
+        if (i == 0) memset(&_Channels[0], 0, sizeof(_Channels[0]));  // channel 0 is a copy of CmdBuffer/IdxBuffer, don't destruct again
+        _Channels[i].CmdBuffer.clear();
+        _Channels[i].IdxBuffer.clear();
+    }
+    _Channels.clear();
+    _TransformationStack.clear();
 }
 
 ImDrawList* ImDrawList::CloneOutput() const
@@ -543,6 +589,159 @@ void ImDrawList::PopTextureID()
     UpdateTextureID();
 }
 
+void ImDrawList::SetTransformation(const ImMatrix& transformation)
+{
+    if (!_TransformationStack.empty())
+    {
+        ImMatrix finalTransformation;
+
+        for (ImDrawTransformation& transient : _TransformationStack)
+            finalTransformation = ImMatrix::Combine(transient.Transformation, finalTransformation);
+        finalTransformation = finalTransformation.Inverted();
+        finalTransformation = ImMatrix::Combine(transformation, finalTransformation);
+        ApplyTransformation(finalTransformation);
+    }
+    else
+        ApplyTransformation(transformation);
+}
+
+void ImDrawList::ApplyTransformation(const ImMatrix& transformation)
+{
+    ImDrawTransformation tr;
+    tr.Transformation             = transformation;
+    tr.VtxStartIdx                = _VtxCurrentIdx;
+    tr.LastInvTransformationScale = _InvTransformationScale;
+    tr.LastHalfPixel              = _HalfPixel;
+    _TransformationStack.push_back(tr);
+
+    const float scaleX = sqrtf(
+        transformation.m00 * transformation.m00 +
+        transformation.m01 * transformation.m01);
+    const float signX = (transformation.m00) < 0.0f ? -1.0f : 1.0f;
+
+    const float scaleY = sqrtf(
+        transformation.m10 * transformation.m10 +
+        transformation.m11 * transformation.m11);
+    const float signY = (transformation.m11) < 0.0f ? -1.0f : 1.0f;
+
+    const float scale = (scaleX + scaleY) * 0.5f;
+
+    const float invScale = scale > 0.0f ? (1.0f / scale) : 1.0f;
+
+    _InvTransformationScale = _InvTransformationScale * invScale;
+    _HalfPixel              = ImVec2(
+        _HalfPixel.x * signX * invScale,
+        _HalfPixel.y * signY * invScale);
+}
+
+void ImDrawList::PopTransformation(int count)
+{
+    IM_ASSERT(_TransformationStack.Size > 0);
+
+    for (int i = 0; i < count; ++i)
+    {
+        const ImDrawTransformation& tr = _TransformationStack.back();
+        if (tr.VtxStartIdx < _VtxCurrentIdx)
+        {
+            const ImMatrix& m = tr.Transformation;
+
+            ImDrawVert* const vertexBegin = VtxBuffer.Data + tr.VtxStartIdx;
+            ImDrawVert* const vertexEnd   = VtxBuffer.Data + _VtxCurrentIdx;
+
+            for (ImDrawVert* vertex = vertexBegin; vertex != vertexEnd; ++vertex)
+            {
+                const float x = vertex->pos.x;
+                const float y = vertex->pos.y;
+
+                vertex->pos.x = m.m00 * x + m.m10 * y + m.m20;
+                vertex->pos.y = m.m01 * x + m.m11 * y + m.m21;
+            }
+        }
+		_InvTransformationScale = tr.LastInvTransformationScale;
+		_HalfPixel = tr.LastHalfPixel;
+
+		_TransformationStack.pop_back();
+	}
+}
+void ImDrawList::ChannelsSplit(int channels_count)
+{
+	IM_ASSERT(_ChannelsCurrent == 0 && _ChannelsCount == 1);
+	int old_channels_count = _Channels.Size;
+	if (old_channels_count < channels_count)
+		_Channels.resize(channels_count);
+	_ChannelsCount = channels_count;
+
+	// _Channels[] (24/32 bytes each) hold storage that we'll swap with this->_CmdBuffer/_IdxBuffer
+	// The content of _Channels[0] at this point doesn't matter. We clear it to make state tidy in a debugger but we don't strictly need to.
+	// When we switch to the next channel, we'll copy _CmdBuffer/_IdxBuffer into _Channels[0] and then _Channels[1] into _CmdBuffer/_IdxBuffer
+	memset(&_Channels[0], 0, sizeof(ImDrawChannel));
+	for (int i = 1; i < channels_count; i++)
+	{
+		if (i >= old_channels_count)
+		{
+			IM_PLACEMENT_NEW(&_Channels[i]) ImDrawChannel();
+		}
+		else
+		{
+			_Channels[i].CmdBuffer.resize(0);
+			_Channels[i].IdxBuffer.resize(0);
+		}
+		if (_Channels[i].CmdBuffer.Size == 0)
+		{
+			ImDrawCmd draw_cmd;
+			draw_cmd.ClipRect = _ClipRectStack.back();
+			draw_cmd.TextureId = _TextureIdStack.back();
+			_Channels[i].CmdBuffer.push_back(draw_cmd);
+		}
+	}
+}
+
+void ImDrawList::ChannelsMerge()
+{
+	// Note that we never use or rely on channels.Size because it is merely a buffer that we never shrink back to 0 to keep all sub-buffers ready for use.
+	if (_ChannelsCount <= 1)
+		return;
+
+	ChannelsSetCurrent(0);
+	if (CmdBuffer.Size && CmdBuffer.back().ElemCount == 0)
+		CmdBuffer.pop_back();
+
+	int new_cmd_buffer_count = 0, new_idx_buffer_count = 0;
+	for (int i = 1; i < _ChannelsCount; i++)
+	{
+		ImDrawChannel& ch = _Channels[i];
+		if (ch.CmdBuffer.Size && ch.CmdBuffer.back().ElemCount == 0)
+			ch.CmdBuffer.pop_back();
+		new_cmd_buffer_count += ch.CmdBuffer.Size;
+		new_idx_buffer_count += ch.IdxBuffer.Size;
+	}
+	CmdBuffer.resize(CmdBuffer.Size + new_cmd_buffer_count);
+	IdxBuffer.resize(IdxBuffer.Size + new_idx_buffer_count);
+
+	ImDrawCmd* cmd_write = CmdBuffer.Data + CmdBuffer.Size - new_cmd_buffer_count;
+	_IdxWritePtr = IdxBuffer.Data + IdxBuffer.Size - new_idx_buffer_count;
+	for (int i = 1; i < _ChannelsCount; i++)
+	{
+		ImDrawChannel& ch = _Channels[i];
+		if (int sz = ch.CmdBuffer.Size) { memcpy(cmd_write, ch.CmdBuffer.Data, sz * sizeof(ImDrawCmd)); cmd_write += sz; }
+		if (int sz = ch.IdxBuffer.Size) { memcpy(_IdxWritePtr, ch.IdxBuffer.Data, sz * sizeof(ImDrawIdx)); _IdxWritePtr += sz; }
+	}
+	UpdateClipRect(); // We call this instead of AddDrawCmd(), so that empty channels won't produce an extra draw call.
+	_ChannelsCount = 1;
+}
+
+void ImDrawList::ChannelsSetCurrent(int idx)
+{
+	IM_ASSERT(idx < _ChannelsCount);
+	if (_ChannelsCurrent == idx) return;
+	memcpy(&_Channels.Data[_ChannelsCurrent].CmdBuffer, &CmdBuffer, sizeof(CmdBuffer)); // copy 12 bytes, four times
+	memcpy(&_Channels.Data[_ChannelsCurrent].IdxBuffer, &IdxBuffer, sizeof(IdxBuffer));
+	_ChannelsCurrent = idx;
+	memcpy(&CmdBuffer, &_Channels.Data[_ChannelsCurrent].CmdBuffer, sizeof(CmdBuffer));
+	memcpy(&IdxBuffer, &_Channels.Data[_ChannelsCurrent].IdxBuffer, sizeof(IdxBuffer));
+	_IdxWritePtr = IdxBuffer.Data + IdxBuffer.Size;
+}
+
 // Reserve space for a number of vertices and indices.
 // You must finish filling your reserved data before calling PrimReserve() again, as it may reallocate or
 // submit the intermediate results. PrimUnreserve() can be used to release unused allocations.
@@ -643,11 +842,13 @@ void ImDrawList::AddPolyline(const ImVec2* points, const int points_count, ImU32
     if (!closed)
         count = points_count-1;
 
-    const bool thick_line = thickness > _FringeScale;
+    thickness *= _InvTransformationScale * _FringeScale;
+
+    const bool thick_line = (fabsf(thickness - 1.0f) > FLT_EPSILON) || (fabsf(_InvTransformationScale - 1.0f) > FLT_EPSILON);
     if (Flags & ImDrawListFlags_AntiAliasedLines)
     {
         // Anti-aliased stroke
-        const float AA_SIZE = 1.0f * _FringeScale;
+        const float AA_SIZE = _InvTransformationScale * _FringeScale;
         const ImU32 col_trans = col & ~IM_COL32_A_MASK;
 
         const int idx_count = thick_line ? count*18 : count*12;
@@ -830,7 +1031,8 @@ void ImDrawList::AddConvexPolyFilled(const ImVec2* points, const int points_coun
     if (Flags & ImDrawListFlags_AntiAliasedFill)
     {
         // Anti-aliased Fill
-        const float AA_SIZE = 1.0f * _FringeScale;
+        const float DIRECTION = (((_HalfPixel.x < 0.0f) ^ (_HalfPixel.y < 0.0f)) ? -1.0f : 1.0f);
+        const float AA_SIZE = _InvTransformationScale * DIRECTION * _FringeScale;
         const ImU32 col_trans = col & ~IM_COL32_A_MASK;
         const int idx_count = (points_count-2)*3 + points_count*6;
         const int vtx_count = (points_count*2);
@@ -854,8 +1056,8 @@ void ImDrawList::AddConvexPolyFilled(const ImVec2* points, const int points_coun
             float dx = p1.x - p0.x;
             float dy = p1.y - p0.y;
             IM_NORMALIZE2F_OVER_ZERO(dx, dy);
-            temp_normals[i0].x = dy;
-            temp_normals[i0].y = -dx;
+            temp_normals[i0].x = dy * DIRECTION;
+            temp_normals[i0].y = -dx * DIRECTION;
         }
 
         for (int i0 = points_count-1, i1 = 0; i1 < points_count; i0 = i1++)
