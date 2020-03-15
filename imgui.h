@@ -1089,6 +1089,7 @@ enum ImGuiKey_
     ImGuiKey_Space,
     ImGuiKey_Enter,
     ImGuiKey_Escape,
+    ImGuiKey_KeyPadEnter,
     ImGuiKey_0,         //
     ImGuiKey_1,         //
     ImGuiKey_2,         //
